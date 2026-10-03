@@ -1,0 +1,1 @@
+{"interval_min": 15, "interval_max": 30, "screen_w": 720, "screen_h": 1280, "travel_pct": 40, "start_pct": 70, "steps": 10, "step_ms": 30, "press_ms": 80, "release_ms": 40}

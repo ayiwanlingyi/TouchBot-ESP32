@@ -1,28 +1,23 @@
 """
-刷视频 — BLE 触摸屏翻页 v2.1
+刷视频 — BLE 触摸屏翻页（ESP32 + SSD1306 128x64 版）
   - 可配置滑动间隔和手机屏幕分辨率（从 config.py 读取）
   - 滑动轨迹参数化（SWIPE_TRAVEL_PCT 等），真机可调
   - 自动模式对 interval min/max 做排序防护，避免设置越界时崩溃
+BLE 协议与手势部分与 ESP32 版完全一致，仅显示层改为 I2C OLED。
 """
-from core.hardware import tft, btn_next, btn_sel
-from drivers.ST7735 import TFT
-from drivers.sysfont import sysfont
+from core.hardware import oled, btn_next, btn_sel, btn_back
+from drivers.ssd1306 import SSD1306
+from app.uartcmd import poll          # PC 串口遥控（有屏模式同样可用）
 import config
-import time, random, gc, struct
+import time, random, gc, struct, math
 
 try:
     import bluetooth
 except ImportError:
     bluetooth = None
 
-BLACK = TFT.BLACK
-WHITE = TFT.WHITE
-GRAY = TFT.GRAY
-NAVY = TFT.NAVY
-GREEN = TFT.GREEN
-RED = TFT.RED
-CYAN = TFT.CYAN
-YELLOW = TFT.YELLOW
+BLACK = SSD1306.BLACK
+WHITE = SSD1306.WHITE
 
 _IRQ_CENTRAL_CONNECT = 1
 _IRQ_CENTRAL_DISCONNECT = 2
@@ -55,15 +50,19 @@ class HIDTouch:
 
     def _init(self):
         gc.collect()
-        # BLE 与 WiFi 共存受限，进入刷视频前先关闭 STA
-        try:
-            import network
-            sta = network.WLAN(network.STA_IF)
-            if sta.isconnected():
-                sta.disconnect()
-            sta.active(False)
-        except Exception:
-            pass
+        # 无屏模式（网页控制台）必须保留 WiFi，否则网页连不上
+        keep_wifi = (getattr(config, "KEEP_WIFI", False)
+                     or getattr(config, "HEADLESS", False))
+        if not keep_wifi:
+            # BLE 与 WiFi 共存受限，进入刷视频前先关闭 STA
+            try:
+                import network
+                sta = network.WLAN(network.STA_IF)
+                if sta.isconnected():
+                    sta.disconnect()
+                sta.active(False)
+            except Exception:
+                pass
         gc.collect()
         time.sleep_ms(500)
 
@@ -133,7 +132,7 @@ class HIDTouch:
         self._ble.gatts_write(self._cccd, struct.pack('<H', 0))
 
         # 广播数据：完整本地名 + HID 服务标志 + 外观（HID 触摸板）
-        n = b"esp32-xm"
+        n = b"esp-bot"
         a = bytearray()
         a.append(2); a.append(1); a.append(6)
         a.append(len(n) + 1); a.append(9); a.extend(n)
@@ -158,13 +157,14 @@ class HIDTouch:
                 attr_handle = d[1]
                 if self._cccd is not None and attr_handle == self._cccd:
                     v = self._ble.gatts_read(self._cccd)
-                    print("CCCD =", list(v))
+                    print("BLE 订阅 CCCD =", list(v))
             except Exception:
                 pass
         elif e == _IRQ_ENCRYPTION_UPDATE:
             try:
                 conn, enc, auth, bond, ks = d
-                print("ENC:", enc, auth, bond, ks)
+                print("BLE 加密状态: enc=%s auth=%s bond=%s ks=%s"
+                      % (enc, auth, bond, ks))
             except Exception:
                 pass
         elif e == _IRQ_PASSKEY_ACTION:
@@ -209,27 +209,52 @@ class HIDTouch:
 
     def swipe_up(self):
         """
-        向上滑动一次。
-        轨迹：起点 70% 屏高 → 终点 30% 屏高（行程 SWIPE_TRAVEL_PCT%），
+        向上滑动一次（拟人化轨迹）。
+        行程：起点 SWIPE_START_PCT% 屏高 → 上移 SWIPE_TRAVEL_PCT%。
+        拟人化（config.SWIPE_HUMANIZE）：每次滑动的水平落点、行程长短、
+        速度曲线（sin 缓动与匀速按随机权重混合 → 随机加速度）、
+        按压时长与采样节奏都有随机抖动，模拟真人手势。
         报文间隔 >= 30ms（匹配 BLE 连接间隔，避免 notify 被覆盖丢弃）。
         """
         scr_w = config.PHONE_SCREEN_W
         scr_h = config.PHONE_SCREEN_H
+        hz = getattr(config, "SWIPE_HUMANIZE", True)    # 拟人化开关
+
         cx = scr_w // 2
         y0 = scr_h * config.SWIPE_START_PCT // 100
         travel = scr_h * config.SWIPE_TRAVEL_PCT // 100
+        if hz:
+            cx += random.randint(-scr_w // 25, scr_w // 25)      # 落点横移 ±4%
+            travel = travel * random.randint(90, 110) // 100     # 行程 ±10%
         y1 = y0 - travel
 
         # 按下并保持，让手机确认这是一次有效拖拽
+        press = config.SWIPE_PRESS_MS
+        if hz:
+            press = max(20, press + random.randint(-15, 25))
         self.send_touch(1, 1, cx, y0)
-        time.sleep_ms(config.SWIPE_PRESS_MS)
+        time.sleep_ms(press)
 
-        # 匀速上移，采样点数与间隔由配置决定
         steps = config.SWIPE_STEPS
+        base = config.SWIPE_STEP_MS
+        # 随机加速度：sin 缓动（起步慢→中段快→收尾慢）与匀速按随机权重
+        # 混合，每次快慢节奏都不同；speed=0 即退回原匀速轨迹
+        speed = (0.5 + random.uniform(0, 0.5)) if hz else 0.0
+        _pi = 3.14159265
         for i in range(1, steps + 1):
-            ny = y0 - travel * i // steps
-            self.send_touch(1, 1, cx, ny)
-            time.sleep_ms(config.SWIPE_STEP_MS)
+            t = i / steps
+            p = (1 - math.cos(_pi * t)) / 2
+            p = t + (p - t) * speed
+            ny = y0 - int(travel * p)
+            if hz:
+                # 手指横向轻微漂移 + 每步节奏抖动（保持 >=30ms）
+                self.send_touch(1, 1,
+                                cx + random.randint(-scr_w // 100,
+                                                    scr_w // 100), ny)
+                time.sleep_ms(base + random.randint(0, 20))
+            else:
+                self.send_touch(1, 1, cx, ny)
+                time.sleep_ms(base)
 
         # 到达终点稍作停顿再抬手，保证完整的手势结束时序
         time.sleep_ms(20)
@@ -239,95 +264,136 @@ class HIDTouch:
         return True
 
 
-# ── UI 辅助 ──
-def _clear_row(y, h=10):
-    tft.fillrect((0, y), (128, h), BLACK)
+# ══ UI 部分（SSD1306 128x64）══
+# 8x8 字体，每行 16 字符；可用行 Y：14 / 25 / 36 / 47 / 56
+TITLE_H     = 11
+TITLE_TXT_Y = 2
+R_RES       = 14   # 手机分辨率
+R_BLE       = 25   # BLE 连接状态
+R_INT       = 36   # 滑动间隔
+R_MSG1      = 47   # 状态 / 提示 1
+R_MSG2      = 56   # 提示 2
+
+
+def _clear_row(y):
+    oled.fillrect((0, y), (128, 11), BLACK)
+
 
 def _draw_title():
-    tft.fill(BLACK)
-    tft.fillrect((0, 0), (128, 16), NAVY)
-    tft.text((4, 3), "SWIPE VIDEO", WHITE, sysfont, 1)
-    tft.text((100, 3), "v2", CYAN, sysfont, 1)
+    oled.fill(BLACK)
+    oled.fillrect((0, 0), (128, TITLE_H), WHITE)
+    oled.text((4, TITLE_TXT_Y), "SWIPE VIDEO", BLACK)
+    oled.text((100, TITLE_TXT_Y), "v2", BLACK)
+    oled.show()
 
-def _draw_info_line(y, label, val, color=WHITE):
-    _clear_row(y, 10)
-    tft.text((4, y), label, GRAY, sysfont, 1)
-    tft.text((50, y), val, color, sysfont, 1)
 
-def _draw_status(connected):
-    _clear_row(30, 10)
-    tft.text((4, 30), "BLE:", GRAY, sysfont, 1)
-    if connected:
-        tft.text((30, 30), "Connected", GREEN, sysfont, 1)
-    else:
-        tft.text((30, 30), "Waiting...", YELLOW, sysfont, 1)
+def _line(y, s, show=True):
+    _clear_row(y)
+    oled.text((0, y), s, WHITE)
+    if show:
+        oled.show()
+
 
 def _draw_resolution():
-    w = config.PHONE_SCREEN_W
-    h = config.PHONE_SCREEN_H
-    _clear_row(18, 10)
-    tft.text((4, 18), "Phone:", GRAY, sysfont, 1)
-    tft.text((44, 18), "%dx%d" % (w, h), CYAN, sysfont, 1)
+    _line(R_RES, "Phone:%dx%d" % (config.PHONE_SCREEN_W,
+                                  config.PHONE_SCREEN_H))
+
+
+def _draw_status(connected):
+    _line(R_BLE, "BLE:Connected" if connected else "BLE:Waiting..")
+
+
+def _draw_interval():
+    _line(R_INT, "Int:%d-%ds" % (config.SWIPE_INTERVAL_MIN,
+                                 config.SWIPE_INTERVAL_MAX))
+
 
 def _draw_idle_hints():
-    _clear_row(84, 44)
-    tft.text((4, 86), "SEL: Auto mode", GRAY, sysfont, 1)
-    tft.text((4, 98), "NXT: Exit", GRAY, sysfont, 1)
-    tft.text((4, 110), "Long SEL: Exit", GRAY, sysfont, 1)
+    _clear_row(R_MSG1)
+    oled.text((0, R_MSG1), "SEL: Start/Stop", WHITE)
+    _clear_row(R_MSG2)
+    oled.text((0, R_MSG2), "BACK: Exit", WHITE)
+    oled.show()
 
-def _draw_auto_header():
-    _clear_row(84, 44)
-    tft.text((4, 84), "Auto swiping", GREEN, sysfont, 1)
-    tft.text((4, 110), "SEL:Stop NXT:Exit", GRAY, sysfont, 1)
 
-def _update_auto_wait(cnt, secs):
-    _clear_row(96, 10)
-    tft.text((4, 96), "Cnt:%d W:%ds" % (cnt, secs), YELLOW, sysfont, 1)
+def _draw_auto_header(cnt, wait):
+    _clear_row(R_MSG1)
+    oled.text((0, R_MSG1), "Auto Cnt:%d" % cnt, WHITE)
+    _clear_row(R_MSG2)
+    oled.text((0, R_MSG2), "W:%ds SEL:Stop" % wait, WHITE)
+    oled.show()
 
 
 # ── 主入口 ──
 def run():
     _draw_title()
     _draw_resolution()
+    _draw_status(False)
 
     h = HIDTouch()
     try:
         if not h.init_ok:
-            _clear_row(44, 20)
-            tft.text((4, 44), "BLE Error!", RED, sysfont, 1)
-            tft.text((4, 58), h._err[:20], RED, sysfont, 1)
-            tft.text((4, 80), "Btn: exit", GRAY, sysfont, 1)
+            _clear_row(R_INT)
+            oled.text((0, R_INT), "BLE Error!", WHITE)
+            _clear_row(R_MSG1)
+            oled.text((0, R_MSG1), h._err[:16], WHITE)
+            _clear_row(R_MSG2)
+            oled.text((0, R_MSG2), "Btn: exit", WHITE)
+            oled.show()
             while not (btn_next.was_pressed() or btn_sel.was_pressed()):
                 time.sleep_ms(100)
             return
 
-        _draw_info_line(42, "Interval:", "%d-%ds" % (
-            config.SWIPE_INTERVAL_MIN, config.SWIPE_INTERVAL_MAX), WHITE)
-        tft.text((4, 56), "BLE ready", GREEN, sysfont, 1)
+        _draw_interval()
+        _line(R_MSG1, "BLE ready")
+
         auto = False
         _idle_drawn = False
         _last_conn = None
 
+        # 串口遥控控制器：START / STOP 直接翻转这里的 auto 标志
+        class _Ctl:
+            def start(self):
+                nonlocal auto
+                if h.is_connected():
+                    auto = True
+                    return True
+                return False
+
+            def stop(self):
+                nonlocal auto
+                auto = False
+                return True
+
+            def status_text(self):
+                return "有屏 | BLE:%s | %s" % (
+                    "已连接" if h.is_connected() else "未连接",
+                    "滑动中" if auto else "已停止")
+
+        ctl = _Ctl()
+
         while True:
+            poll(h, ctl)                # PC 串口遥控（与无屏模式同一套指令）
             _conn = h.is_connected()
             if _conn != _last_conn:
                 _draw_status(_conn)
                 _last_conn = _conn
 
             if auto and h.is_connected():
-                _draw_auto_header()
+                _idle_drawn = False
                 cnt = 0
                 _nxt_exit = False
                 _last_cnt = -1
                 _last_s = -1
-                _update_auto_wait(cnt, 0)
+                _draw_auto_header(cnt, 0)
                 _last_cnt = cnt
                 _last_s = 0
+
                 while True:
                     if btn_sel.was_pressed():
                         auto = False
                         break
-                    if btn_next.was_pressed():
+                    if btn_next.was_pressed() or btn_back.was_pressed():
                         auto = False
                         _nxt_exit = True
                         break
@@ -344,20 +410,36 @@ def run():
                         if btn_sel.was_pressed():
                             auto = False
                             break
-                        if btn_next.was_pressed():
+                        if btn_next.was_pressed() or btn_back.was_pressed():
                             auto = False
                             _nxt_exit = True
                             break
                         if not h.is_connected():
                             auto = False
                             break
+                        # 每秒拆成 10 × 100ms，串口指令最多等 100ms 就被处理
+                        for _t in range(10):
+                            poll(h, ctl)
+                            if btn_sel.was_pressed():
+                                auto = False
+                                break
+                            if btn_next.was_pressed() or btn_back.was_pressed():
+                                auto = False
+                                _nxt_exit = True
+                                break
+                            if not h.is_connected():
+                                auto = False
+                                break
+                            time.sleep_ms(100)
+                        if not auto:
+                            break
                         if cnt != _last_cnt or s != _last_s:
-                            _update_auto_wait(cnt, s)
+                            _draw_auto_header(cnt, s)
                             _last_cnt = cnt
                             _last_s = s
-                        time.sleep(1)
                     if not auto:
                         break
+
                 if _nxt_exit:
                     return
                 if not h.is_connected():
@@ -375,8 +457,8 @@ def run():
                 else:
                     return
 
-            # btn_next 退出刷视频，返回主菜单
-            if btn_next.was_pressed():
+            # BACK / NXT 退出刷视频，返回主菜单
+            if btn_back.was_pressed() or btn_next.was_pressed():
                 return
 
             # 长按 SEL 退出

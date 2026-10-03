@@ -1,0 +1,8 @@
+micropython对应的固件下载地址
+
+https://micropython.org/download/ESP32_GENERIC
+
+
+TouchBot-ESP32-main.zip	是Fork执行脚本仓库备份的源码,和固件无关
+
+放入脚本时注意芯片编号
